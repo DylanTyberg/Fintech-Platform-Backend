@@ -36,6 +36,9 @@ export class StockAppStack extends cdk.Stack {
     const aiJobsTable = dynamodb.Table.fromTableName(
       this, 'AiJobsTable', 'ai-jobs'
     );
+    const newsTable = dynamodb.Table.fromTableName(
+      this, 'NewsTable', 'stock-app-data-news'
+    );
 
     // -----------------------------------------------------------------------
     // 2. S3 — Static hosting for React Frontend
@@ -51,6 +54,8 @@ export class StockAppStack extends cdk.Stack {
       MOVERS_TABLE: moversTable.tableName,
       USER_DATA_TABLE: userDataTable.tableName,
       AI_JOBS_TABLE: aiJobsTable.tableName,
+      MARKETAUX_API_KEY: process.env.MARKETAUX_API_KEY ?? '',
+      NEWS_TABLE: newsTable.tableName,
     };
 
     const commonProps = {
@@ -165,6 +170,16 @@ export class StockAppStack extends cdk.Stack {
       { timeout: cdk.Duration.minutes(5) }
     );
     moversTable.grantReadWriteData(stockMoversPutFn);
+
+
+    // -----------------------------------------------------------------------
+    // NEWS LAMBDA
+    //    GET /news?symbols=AAPL,MSFT&type=positive
+    // -----------------------------------------------------------------------
+    const stockNewsGetFn = mkLambda(
+      'StockNewsGet', 'stock-news-get', 'stockNewsGet'
+    );
+    newsTable.grantReadWriteData(stockNewsGetFn);
 
     // -----------------------------------------------------------------------
     // 7. DAILY LAMBDAS
@@ -379,6 +394,11 @@ export class StockAppStack extends cdk.Stack {
     const moversRes = api.root.addResource('movers');
     moversRes.addMethod('GET', int(stockMoversGetFn));
     moversRes.addMethod('POST', int(stockMoversPutFn));
+
+    // ── /news ─────────────────────────────────────────────────────────────────
+    // GET /news?symbols=AAPL,MSFT&type=positive
+    const newsRes = api.root.addResource('news');
+    newsRes.addMethod('GET', int(stockNewsGetFn));
 
     // ── /daily ────────────────────────────────────────────────────────────────
     // GET  /daily       → stock-daily-get  (TODO: confirm)
