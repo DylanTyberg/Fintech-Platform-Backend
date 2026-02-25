@@ -1,0 +1,27 @@
+{
+  "name": "stock-app-cdk",
+  "version": "1.0.0",
+  "bin": {
+    "stock-app": "bin/stock-app.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "synth": "cdk synth",
+    "deploy": "cdk deploy",
+    "diff": "cdk diff",
+    "destroy": "cdk destroy"
+  },
+  "devDependencies": {
+    "@types/node": "20.x",
+    "aws-cdk": "2.x",
+    "typescript": "~5.4.5"
+  },
+  "dependencies": {
+    "@aws-cdk/aws-scheduler-alpha": "^2.170.0-alpha.0",
+    "@aws-cdk/aws-scheduler-targets-alpha": "^2.170.0-alpha.0",
+    "aws-cdk-lib": "2.x",
+    "constructs": "^10.0.0",
+    "source-map-support": "^0.5.21"
+  }
+}
