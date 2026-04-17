@@ -47,7 +47,7 @@ export const handler = async (event) => {
 
     // Invoke processor Lambda
     await lambdaClient.send(new InvokeCommand({
-      FunctionName: process.env.PROCESSOR_LAMBDA_NAME || "Stock-AI-Insight-Portfolio-Suggestions",
+      FunctionName: process.env.INSIGHT_SUGGESTIONS_FUNCTION_NAME || "stock-ai-insight-suggestions-v2",
       InvocationType: "Event",
       Payload: JSON.stringify({
         jobId: jobId,
