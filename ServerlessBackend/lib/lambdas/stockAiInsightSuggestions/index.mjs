@@ -11,13 +11,24 @@ const dynamo = DynamoDBDocumentClient.from(client);
 
 const getPortfolioFromDB = async (userId) => {
   if (!userId) return ["this user is not signed in."];
-  const params = {
+  
+  const data = await dynamo.send(new QueryCommand({
     TableName: process.env.USER_DATA_TABLE,
     KeyConditionExpression: "userId = :userId",
     ExpressionAttributeValues: { ":userId": userId }
-  };
-  const data = await dynamo.send(new QueryCommand(params));
-  return data.Items;
+  }));
+
+  const items = data.Items;
+
+  // Only send current state to Bedrock — not historical snapshots
+  const relevant = items.filter(item =>
+    item.type === 'cash#' ||
+    item.type?.startsWith('holding#') ||
+    item.type?.startsWith('watchlist#')
+  );
+
+  // Fall back to first 10 items if filter returns nothing
+  return relevant.length > 0 ? relevant : items.slice(0, 10);
 };
 
 // Fetch conversation history from DynamoDB
@@ -92,6 +103,9 @@ export const handler = async (event) => {
       getPortfolioFromDB(userId),
       getConversationHistory(sessionId)
     ]);
+
+    console.log('Portfolio items:', portfolio?.length);
+    console.log('Portfolio JSON size:', JSON.stringify(portfolio).length, 'chars');
 
     const { prompts: contextPrompts, responses } = history;
 
