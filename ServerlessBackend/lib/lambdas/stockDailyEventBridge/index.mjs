@@ -1,5 +1,6 @@
 import https from 'https';
 import { DynamoDBClient, BatchWriteItemCommand, QueryCommand } from '@aws-sdk/client-dynamodb';
+import { ok, err } from "/opt/response.mjs";
 
 const dynamodb = new DynamoDBClient({});
 const tableName = 'stock-app-data-daily';
@@ -33,17 +34,16 @@ const fetchPolygonData = (symbol, from, to, apiKey) => {
 };
 
 export const handler = async (event) => {
-  const apiKey = 'TlYNfcSis7sJMHlwCKfwzpg7cuZlubpU';
-  
+  const apiKey = process.env.POLYGON_API_KEY;
+
   // Get all S&P 500 symbols from event
   const symbols = event.symbols || ["AAPL","MSFT","GOOGL","GOOG","AMZN","NVDA","META","TSLA","BRK.B","JPM",
 "JNJ","V","MA","UNH","XOM","PG","HD","LLY","AVGO","CVX",
 "COST","PEP","KO","MRK","ABBV","WMT","DIS","NFLX","ADBE","CRM",
 "AMD","INTC","QCOM","TXN","ORCL","CSCO","IBM","GE","BA","CAT",
 "MCD","NKE","LOW","SBUX","GS","MS","BAC","C","BLK", "SPY", "QQQ", "DIA", "IWM", "XLB", "XLE", "XLF", "XLV", "XLI", "XLY", "XLP", "XLK", "XLU", "XLRE", "XLC"
-    ]
-    ;
-  
+  ];
+
   const todaysDate = new Date();
   const formattedTodaysDate = `${todaysDate.getFullYear()}-${String(todaysDate.getMonth() + 1).padStart(2, '0')}-${String(todaysDate.getDate()).padStart(2, '0')}`;
 
@@ -71,14 +71,14 @@ export const handler = async (event) => {
       };
 
       const checkResponse = await dynamodb.send(new QueryCommand(checkParams));
-      
+
       let fromDate;
       let isBackfill = false;
 
       if (checkResponse.Items && checkResponse.Items.length > 0) {
         const lastItem = checkResponse.Items[0];
         const lastItemDate = new Date(lastItem.timestamp.S);
-        
+
         if (
           lastItemDate.getFullYear() === todaysDate.getFullYear() &&
           lastItemDate.getMonth() === todaysDate.getMonth() &&
@@ -88,7 +88,7 @@ export const handler = async (event) => {
           results.alreadyExists.push(symbol);
           return;
         }
-        
+
         fromDate = `${lastItemDate.getFullYear()}-${String(lastItemDate.getMonth() + 1).padStart(2, '0')}-${String(lastItemDate.getDate()).padStart(2, '0')}`;
       } else {
         const oneYearAgo = new Date();
@@ -148,11 +148,8 @@ export const handler = async (event) => {
   // Wait for all stocks to process in parallel
   await Promise.all(promises);
 
-  return {
-    statusCode: 200,
-    body: JSON.stringify({
-      message: `Processed ${symbols.length} stocks for ${formattedTodaysDate}`,
-      results: results,
-    }),
-  };
+  return ok({
+    message: `Processed ${symbols.length} stocks for ${formattedTodaysDate}`,
+    results,
+  });
 };

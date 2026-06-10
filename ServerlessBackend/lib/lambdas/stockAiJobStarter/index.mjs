@@ -1,91 +1,110 @@
 // starter.js
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
 import { randomUUID } from "crypto";
+import { ok, err } from "/opt/response.mjs";
 
 const dynamoClient = new DynamoDBClient({});
 const dynamo = DynamoDBDocumentClient.from(dynamoClient);
 const lambdaClient = new LambdaClient({});
 
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+  'Access-Control-Allow-Methods': 'POST,OPTIONS',
+};
+
+const RATE_LIMIT = 5;
+const WINDOW_MS = 5 * 60 * 1000;
+
+// Add this function at the top of starter.js
+const extractSubFromToken = (authHeader) => {
+  if (!authHeader) return null;
+  try {
+    const token = authHeader.replace('Bearer ', '');
+    const payload = token.split('.')[1];
+    const decoded = JSON.parse(
+      Buffer.from(payload, 'base64url').toString('utf8')
+    );
+    return decoded.sub || null;
+  } catch {
+    return null;
+  }
+};
+
 export const handler = async (event) => {
-  console.log("Event received:", JSON.stringify(event)); // DEBUG
-  
   if (event.httpMethod === "OPTIONS") {
-    return {
-      statusCode: 200,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'POST,OPTIONS'
-      },
-    };
+    return ok(null, 200, CORS);
   }
 
   try {
-    const body = JSON.parse(event.body);
-    console.log("Parsed body:", body); // DEBUG
-    
-    const jobId = randomUUID();
-    console.log("Generated jobId:", jobId); // DEBUG
+    const callerIp = event.requestContext?.identity?.sourceIp ?? 'unknown';
+    const windowStart = new Date(Date.now() - WINDOW_MS).toISOString();
 
-    // Store initial job status
+    // Rate limiting — unchanged, already good
+    const recentJobs = await dynamo.send(new QueryCommand({
+      TableName: process.env.AI_JOBS_TABLE,
+      IndexName: "callerIp-createdAt-index",
+      KeyConditionExpression: "callerIp = :ip AND createdAt > :windowStart",
+      ExpressionAttributeValues: {
+        ":ip": callerIp,
+        ":windowStart": windowStart,
+      },
+      Select: "COUNT",
+    }));
+
+    if (recentJobs.Count >= RATE_LIMIT) {
+      return err(429, `Rate limit exceeded. Maximum ${RATE_LIMIT} AI requests per 5 minutes.`, CORS);
+    }
+
+    const body = JSON.parse(event.body);
+
+    // Extract userId from JWT claims — never trust client-supplied userId
+    // Will be null for unauthenticated users (public endpoint)
+    const userSub = extractSubFromToken(
+      event.headers?.Authorization || event.headers?.authorization
+    );
+
+    // Validate prompt exists
+    if (!body.prompt || typeof body.prompt !== 'string' || body.prompt.trim() === '') {
+      return err(400, 'prompt is required', CORS);
+    }
+
+    const jobId = randomUUID();
+
+    // Store job — no client-supplied history or userId
     await dynamo.send(new PutCommand({
-      TableName: "ai-jobs",
+      TableName: process.env.AI_JOBS_TABLE,
       Item: {
-        jobId: jobId,
+        jobId,
         status: "PROCESSING",
-        userId: body.userId,
-        prompt: body.prompt,
-        prompts: body.prompts || [],
-        responses: body.responses || [],
+        userSub,                          // from JWT, not client
+        prompt: body.prompt.trim(),
+        sessionId: body.sessionId || null, // for conversation continuity
         createdAt: new Date().toISOString(),
-        ttl: Math.floor(Date.now() / 1000) + 86400
+        callerIp,
+        ttl: Math.floor(Date.now() / 1000) + 86400,
       }
     }));
-    console.log("Saved to DynamoDB"); // DEBUG
 
-    // Invoke processor Lambda
+    // Invoke processor — no prompts/responses passed, history loaded server-side
     await lambdaClient.send(new InvokeCommand({
-      FunctionName: process.env.INSIGHT_SUGGESTIONS_FUNCTION_NAME || "stock-ai-insight-suggestions-v2",
+      FunctionName: process.env.INSIGHT_SUGGESTIONS_FUNCTION_NAME,
       InvocationType: "Event",
       Payload: JSON.stringify({
-        jobId: jobId,
-        userId: body.userId,
-        prompt: body.prompt,
-        prompts: body.prompts || [],
-        responses: body.responses || []
+        jobId,
+        userSub,                          // from JWT claims
+        prompt: body.prompt.trim(),
+        sessionId: body.sessionId || null,
+        // prompts/responses intentionally removed — loaded from DynamoDB in processor
       })
     }));
-    console.log("Invoked processor Lambda"); // DEBUG
 
-    return {
-      statusCode: 202,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'POST,OPTIONS'
-      },
-      body: JSON.stringify({
-        jobId: jobId,
-        status: "PROCESSING",
-        message: "Job submitted successfully"
-      })
-    };
-    
+    return ok({ jobId, status: "PROCESSING", message: "Job submitted successfully" }, 202, CORS);
+
   } catch (error) {
-    console.error("Error in starter lambda:", error); // DEBUG
-    return {
-      statusCode: 500,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'POST,OPTIONS'
-      },
-      body: JSON.stringify({
-        error: error.message,
-        details: error.stack
-      })
-    };
+    console.error("Error in starter lambda:", error);
+    return err(500, 'Internal server error', CORS);
   }
 };

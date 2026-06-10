@@ -1,5 +1,6 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, ScanCommand, BatchWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { ok, err } from "/opt/response.mjs";
 
 const client = new DynamoDBClient({});
 const docClient = DynamoDBDocumentClient.from(client);
@@ -37,7 +38,10 @@ export const handler = async () => {
     }
 
     console.log("Deletion complete.");
-  } catch (err) {
-    console.error(err);
+    return ok({ message: "Deletion complete." });
+
+  } catch (error) {
+    console.error(error);
+    return err(500, error.message);
   }
 };

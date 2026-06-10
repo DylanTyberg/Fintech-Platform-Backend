@@ -6,25 +6,36 @@
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
+import { ok, err } from "/opt/response.mjs";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
 const MARKETAUX_API_KEY = "OmsRbojVnf7zaJYADxuFEC8LagnlEjUcWz9jWDBT";
-const NEWS_TABLE = "stock-app-data-news"
+const NEWS_TABLE = "stock-app-data-news";
+
+const CORS = {
+  'Access-Control-Allow-Origin':  '*',
+  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Methods': 'GET,OPTIONS',
+};
 
 const SENTIMENT_FILTERS = {
-  positive:  { must_have_entities: true, sentiment_gte: 0.3  },
-  negative:  { must_have_entities: true, sentiment_lte: -0.3 },
-  neutral:   { must_have_entities: true, sentiment_gte: -0.1, sentiment_lte: 0.1 },
-  recent:    { must_have_entities: true },
+  positive: { must_have_entities: true, sentiment_gte: 0.3  },
+  negative: { must_have_entities: true, sentiment_lte: -0.3 },
+  neutral:  { must_have_entities: true, sentiment_gte: -0.1, sentiment_lte: 0.1 },
+  recent:   { must_have_entities: true },
 };
 
 export const handler = async (event) => {
+  if (event.httpMethod === 'OPTIONS') {
+    return ok(null, 200, CORS);
+  }
+
   const { symbols, type = 'recent' } = event.queryStringParameters ?? {};
 
-  if (!symbols) return res(400, { error: 'Missing query param: symbols' });
+  if (!symbols) return err(400, 'Missing query param: symbols', CORS);
   if (!SENTIMENT_FILTERS[type]) {
-    return res(400, { error: `Invalid type. Must be one of: ${Object.keys(SENTIMENT_FILTERS).join(', ')}` });
+    return err(400, `Invalid type. Must be one of: ${Object.keys(SENTIMENT_FILTERS).join(', ')}`, CORS);
   }
 
   // Normalize symbols — sort and uppercase for consistent cache key
@@ -40,10 +51,10 @@ export const handler = async (event) => {
 
     if (cached.Item && cached.Item.ttl > Math.floor(Date.now() / 1000)) {
       console.log(`Cache hit: ${cacheKey}`);
-      return res(200, cached.Item.data);
+      return ok(cached.Item.data, 200, CORS);
     }
-  } catch (err) {
-    console.warn('Cache read error:', err.message);
+  } catch (error) {
+    console.warn('Cache read error:', error.message);
   }
 
   // Cache miss — fetch from Marketaux
@@ -62,7 +73,7 @@ export const handler = async (event) => {
 
     // Write to cache with 1 hour TTL
     await ddb.send(new PutCommand({
-      TableName: process.env.NEWS_TABLE,
+      TableName: NEWS_TABLE,
       Item: {
         cacheKey,
         data,
@@ -71,10 +82,10 @@ export const handler = async (event) => {
       },
     }));
 
-    return res(200, data);
-  } catch (err) {
-    console.error('Marketaux fetch error:', err);
-    return res(500, { error: 'Failed to fetch news' });
+    return ok(data, 200, CORS);
+  } catch (error) {
+    console.error('Marketaux fetch error:', error);
+    return err(500, 'Failed to fetch news', CORS);
   }
 };
 
@@ -89,10 +100,4 @@ const fetchJson = (url) => new Promise((resolve, reject) => {
       });
     }).on('error', reject);
   });
-});
-
-const res = (statusCode, body) => ({
-  statusCode,
-  headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-  body: JSON.stringify(body),
 });

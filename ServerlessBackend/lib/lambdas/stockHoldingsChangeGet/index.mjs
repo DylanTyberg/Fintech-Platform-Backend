@@ -1,23 +1,21 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, QueryCommand } from "@aws-sdk/lib-dynamodb";
+import { ok, err } from "/opt/response.mjs";
 
 const client = new DynamoDBClient({});
 const dynamo = DynamoDBDocumentClient.from(client);
 
+const CORS = {
+  'Access-Control-Allow-Origin':  '*',
+  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+};
+
 export const handler = async (event) => {
-  
   if (event.httpMethod === 'OPTIONS') {
-    return {
-      statusCode: 200,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
-      },
-      body: ''
-    };
+    return ok(null, 200, CORS);
   }
-  
+
   const body = JSON.parse(event.body);
   const holdings = body.holdings;
 
@@ -33,7 +31,7 @@ export const handler = async (event) => {
         Limit: 1,
         ScanIndexForward: true
       };
-      
+
       const last_params = {
         TableName: "stock-app-data",
         KeyConditionExpression: "symbol = :symbol",
@@ -55,8 +53,8 @@ export const handler = async (event) => {
         firstPrice: first_response.Items?.[0],
         lastPrice: last_response.Items?.[0],
         change: first_response.Items?.[0]?.close && last_response.Items?.[0]?.close
-        ? (((last_response.Items[0].close - first_response.Items[0].close) / first_response.Items[0].close) * 100).toFixed(2)
-        : null
+          ? (((last_response.Items[0].close - first_response.Items[0].close) / first_response.Items[0].close) * 100).toFixed(2)
+          : null
       };
     });
 
@@ -64,25 +62,10 @@ export const handler = async (event) => {
     const results = await Promise.all(promises);
     console.log(results);
 
-    return {
-      statusCode: 200,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'GET,OPTIONS,POST'
-      },
-      body: JSON.stringify(results)
-    };
+    return ok(results, 200, CORS);
+
   } catch (error) {
     console.error("Error fetching stock data:", error);
-    return {
-      statusCode: 500,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'GET,OPTIONS,POST'
-      },
-      body: JSON.stringify({ error: "error fetching data" })
-    };
+    return err(500, "error fetching data", CORS);
   }
 };

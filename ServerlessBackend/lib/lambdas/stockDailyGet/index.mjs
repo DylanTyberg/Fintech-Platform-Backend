@@ -1,36 +1,26 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, QueryCommand } from "@aws-sdk/lib-dynamodb";
+import { ok, err } from "/opt/response.mjs";
 
 const client = new DynamoDBClient({});
 const dynamo = DynamoDBDocumentClient.from(client);
 
+const CORS = {
+  'Access-Control-Allow-Origin':  '*',
+  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Methods': 'POST,OPTIONS',
+};
+
 export const handler = async (event) => {
-  // Handle OPTIONS for CORS preflight
   if (event.httpMethod === "OPTIONS") {
-    return {
-      statusCode: 200,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'POST,OPTIONS'
-      },
-    };
+    return ok(null, 200, CORS);
   }
 
-  // Parse body to get array of symbols
   const body = JSON.parse(event.body);
   const symbols = body.symbols; // Expecting { "symbols": ["AAPL", "MSFT", "GOOGL"] }
 
   if (!symbols || !Array.isArray(symbols) || symbols.length === 0) {
-    return {
-      statusCode: 400,
-      body: JSON.stringify({ error: "symbols array is required" }),
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'POST,OPTIONS'
-      },
-    };
+    return err(400, "symbols array is required", CORS);
   }
 
   try {
@@ -47,44 +37,18 @@ export const handler = async (event) => {
 
       try {
         const data = await dynamo.send(new QueryCommand(params));
-        return {
-          symbol: symbol,
-          data: data.Items,
-          success: true
-        };
+        return { symbol, data: data.Items, success: true };
       } catch (error) {
         console.error(`Error fetching ${symbol}:`, error);
-        return {
-          symbol: symbol,
-          error: error.message,
-          success: false
-        };
+        return { symbol, error: error.message, success: false };
       }
     });
 
     const results = await Promise.all(promises);
 
-    return {
-      statusCode: 200,
-      body: JSON.stringify({
-        results: results,
-        total: symbols.length
-      }),
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'POST,OPTIONS'
-      },
-    };
+    return ok({ results, total: symbols.length }, 200, CORS);
+
   } catch (error) {
-    return {
-      statusCode: 500,
-      body: JSON.stringify({ error: error.message }),
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'POST,OPTIONS'
-      },
-    };
+    return err(500, error.message, CORS);
   }
 };

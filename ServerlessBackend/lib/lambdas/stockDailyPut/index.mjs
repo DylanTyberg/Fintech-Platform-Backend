@@ -1,14 +1,21 @@
 import https from 'https';
 import { DynamoDBClient, BatchWriteItemCommand, QueryCommand } from '@aws-sdk/client-dynamodb';
+import { ok, err } from "/opt/response.mjs";
 
 const dynamodb = new DynamoDBClient({});
 const tableName = 'stock-app-data-daily';
 
+const CORS = {
+  'Access-Control-Allow-Origin':  '*',
+  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Methods': 'OPTIONS,POST,GET',
+};
+
 const fetchPolygonData = (symbol, from, to, apiKey) => {
   const url = `https://api.polygon.io/v2/aggs/ticker/${symbol}/range/1/day/${from}/${to}?adjusted=true&sort=asc&limit=50000&apiKey=${apiKey}`;
 
-  console.log("from", from)
-  console.log("to", to)
+  console.log("from", from);
+  console.log("to", to);
 
   return new Promise((resolve, reject) => {
     https.get(url, (response) => {
@@ -20,7 +27,7 @@ const fetchPolygonData = (symbol, from, to, apiKey) => {
         try {
           const data = JSON.parse(body);
           console.log(`Polygon raw response for ${symbol}:`, JSON.stringify(data));
-          if ((data.status !== 'OK' && data.status !=='DELAYED') || !data.results) {
+          if ((data.status !== 'OK' && data.status !== 'DELAYED') || !data.results) {
             reject(new Error('Invalid data or no data available'));
           } else {
             resolve(data);
@@ -36,22 +43,13 @@ const fetchPolygonData = (symbol, from, to, apiKey) => {
 };
 
 export const handler = async (event) => {
-  
   if (event.httpMethod === "OPTIONS") {
-    return {
-      statusCode: 200,
-      headers: {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Headers": "Content-Type",
-        "Access-Control-Allow-Methods": "OPTIONS,POST,GET",
-      },
-    };
+    return ok(null, 200, CORS);
   }
-  
-  const symbol = event.queryStringParameters.symbol;
-  const apiKey = 'TlYNfcSis7sJMHlwCKfwzpg7cuZlubpU';
 
-  
+  const symbol = event.queryStringParameters.symbol;
+  const apiKey = process.env.POLYGON_API_KEY;
+
   const todaysDate = new Date();
   const formatedTodaysDate = `${todaysDate.getFullYear()}-${String(todaysDate.getMonth() + 1).padStart(2, '0')}-${String(todaysDate.getDate()).padStart(2, '0')}`;
 
@@ -59,7 +57,7 @@ export const handler = async (event) => {
     TableName: tableName,
     KeyConditionExpression: 'symbol = :symbol',
     ExpressionAttributeValues: {
-      ':symbol': {S: symbol},
+      ':symbol': { S: symbol },
     },
     ScanIndexForward: false,
     Limit: 1,
@@ -68,98 +66,69 @@ export const handler = async (event) => {
   try {
     const checkDatabaseResponse = await dynamodb.send(new QueryCommand(checkDatabaseParams));
     let formattedLastDate;
+
     if (checkDatabaseResponse.Items.length > 0) {
       const lastItem = checkDatabaseResponse.Items[checkDatabaseResponse.Items.length - 1];
       const lastItemDate = new Date(lastItem.timestamp.S);
       formattedLastDate = `${lastItemDate.getFullYear()}-${String(lastItemDate.getMonth() + 1).padStart(2, '0')}-${String(lastItemDate.getDate()).padStart(2, '0')}`;
 
-
-      if (lastItemDate.getFullYear() === todaysDate.getFullYear() && lastItemDate.getMonth() === todaysDate.getMonth() && lastItemDate.getDate() === todaysDate.getDate()) {
-        return {
-          statusCode: 200,
-          headers: {
-            "Access-Control-Allow-Origin": "*",
-          },
-          body: JSON.stringify({ message: "Data already exists for today." }),
-        };
+      if (
+        lastItemDate.getFullYear() === todaysDate.getFullYear() &&
+        lastItemDate.getMonth() === todaysDate.getMonth() &&
+        lastItemDate.getDate() === todaysDate.getDate()
+      ) {
+        return ok({ message: "Data already exists for today." }, 200, CORS);
       }
-      
-
-    }
-    else {
+    } else {
       const oneYearAgo = new Date();
       oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
       formattedLastDate = `${oneYearAgo.getFullYear()}-${String(oneYearAgo.getMonth() + 1).padStart(2, '0')}-${String(oneYearAgo.getDate()).padStart(2, '0')}`;
-
     }
 
-      try {
-        const data = await fetchPolygonData(symbol, formattedLastDate, formatedTodaysDate, apiKey);
+    try {
+      const data = await fetchPolygonData(symbol, formattedLastDate, formatedTodaysDate, apiKey);
+      const bars = data.results;
 
-        const bars = data.results;
-
-        if (!bars || bars.length === 0) {
-          console.log(`No new data for symbol ${symbol}`);
-          return {
-            statusCode: 200,
-            headers: {
-              "Access-Control-Allow-Origin": "*",
-            },
-            body: JSON.stringify({ message: "No new data available." }),
-          };
-        }
-
-        const BATCH_SIZE = 25;
-        const items = [];
-
-        for (const bar of bars) {
-          const timestamp = new Date(bar.t)
-          const formattedTimestamp = `${timestamp.getFullYear()}-${String(timestamp.getMonth() + 1).padStart(2, "0")}-${String(timestamp.getDate()).padStart(2, "0")}`;
-
-
-          items.push({
-            PutRequest: {
-              Item: {
-                symbol: { S: symbol },
-                timestamp: { S: formattedTimestamp },
-                open: { N: bar.o.toString() },
-                high: { N: bar.h.toString() },
-                low: { N: bar.l.toString() },
-                close: { N: bar.c.toString() },
-                volume: { N: bar.v.toString() },
-              }
-            }
-          });
-        }
-
-        // Batch write in chunks of 25
-        for (let i = 0; i < items.length; i += BATCH_SIZE) {
-          const batch = items.slice(i, i + BATCH_SIZE);
-
-          const params = {
-            RequestItems: {
-              [tableName]: batch
-            }
-          };
-
-          await dynamodb.send(new BatchWriteItemCommand(params));
-        }
-
-      } catch (error) {
-        console.log(JSON.stringify({ message: `Error fetching or storing data for ${symbol}`, error: error.message }));
+      if (!bars || bars.length === 0) {
+        console.log(`No new data for symbol ${symbol}`);
+        return ok({ message: "No new data available." }, 200, CORS);
       }
+
+      const BATCH_SIZE = 25;
+      const items = [];
+
+      for (const bar of bars) {
+        const timestamp = new Date(bar.t);
+        const formattedTimestamp = `${timestamp.getFullYear()}-${String(timestamp.getMonth() + 1).padStart(2, "0")}-${String(timestamp.getDate()).padStart(2, "0")}`;
+
+        items.push({
+          PutRequest: {
+            Item: {
+              symbol: { S: symbol },
+              timestamp: { S: formattedTimestamp },
+              open: { N: bar.o.toString() },
+              high: { N: bar.h.toString() },
+              low: { N: bar.l.toString() },
+              close: { N: bar.c.toString() },
+              volume: { N: bar.v.toString() },
+            }
+          }
+        });
+      }
+
+      // Batch write in chunks of 25
+      for (let i = 0; i < items.length; i += BATCH_SIZE) {
+        const batch = items.slice(i, i + BATCH_SIZE);
+        await dynamodb.send(new BatchWriteItemCommand({ RequestItems: { [tableName]: batch } }));
+      }
+
+    } catch (error) {
+      console.log(JSON.stringify({ message: `Error fetching or storing data for ${symbol}`, error: error.message }));
+    }
+
   } catch (error) {
     console.log(JSON.stringify({ message: "Error checking database", error: error.message }));
   }
 
-
-  
-
-  return {
-    statusCode: 200,
-    headers: {
-      "Access-Control-Allow-Origin": "*",
-    },
-    body: JSON.stringify({ message: "Data stored in DynamoDB successfully for all symbols." }),
-  };
+  return ok({ message: "Data stored in DynamoDB successfully for all symbols." }, 200, CORS);
 };

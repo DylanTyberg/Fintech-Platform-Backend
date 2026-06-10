@@ -1,27 +1,26 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, QueryCommand, BatchWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { ok, err } from "/opt/response.mjs";
 
 const client = new DynamoDBClient({});
 const dynamo = DynamoDBDocumentClient.from(client);
 
+const CORS = {
+  'Access-Control-Allow-Origin':  '*',
+  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Methods': 'DELETE,OPTIONS',
+};
+
 export const handler = async (event) => {
-  
   if (event.httpMethod === 'OPTIONS') {
-    return {
-      statusCode: 200,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'DELETE,OPTIONS'
-      },
-      body: ''
-    };
+    return ok(null, 200, CORS);
   }
-  
+
   const params = JSON.parse(event.body);
   console.log(params);
 
-  const { user } = params;
+  const userId = event.requestContext?.authorizer?.claims?.sub;
+  if (!userId) return err(401, 'Unauthorized', CORS);
 
   try {
     // Query all items for this user
@@ -29,30 +28,19 @@ export const handler = async (event) => {
       TableName: "stock-user-data",
       KeyConditionExpression: "userId = :userId",
       ExpressionAttributeValues: {
-        ":userId": user
+        ":userId": userId
       }
     };
 
     const queryResult = await dynamo.send(new QueryCommand(queryParams));
-    
+
     // Filter out items that start with "watchlist#"
-    const itemsToDelete = queryResult.Items.filter(item => 
+    const itemsToDelete = queryResult.Items.filter(item =>
       !item.type.startsWith('watchlist#')
     );
 
     if (itemsToDelete.length === 0) {
-      return {
-        statusCode: 200,
-        body: JSON.stringify({ 
-          message: 'No portfolio items to delete',
-          deletedCount: 0
-        }),
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Headers': 'Content-Type',
-          'Access-Control-Allow-Methods': 'DELETE,OPTIONS'
-        },
-      };
+      return ok({ message: 'No portfolio items to delete', deletedCount: 0 }, 200, CORS);
     }
 
     // DynamoDB BatchWrite can handle max 25 items at a time
@@ -61,7 +49,7 @@ export const handler = async (event) => {
 
     for (let i = 0; i < itemsToDelete.length; i += batchSize) {
       const batch = itemsToDelete.slice(i, i + batchSize);
-      
+
       const deleteRequests = batch.map(item => ({
         DeleteRequest: {
           Key: {
@@ -71,42 +59,16 @@ export const handler = async (event) => {
         }
       }));
 
-      const batchParams = {
-        RequestItems: {
-          "stock-user-data": deleteRequests
-        }
-      };
-
-      await dynamo.send(new BatchWriteCommand(batchParams));
+      await dynamo.send(new BatchWriteCommand({
+        RequestItems: { "stock-user-data": deleteRequests }
+      }));
       deletedCount += batch.length;
     }
 
-    return {
-      statusCode: 200,
-      body: JSON.stringify({ 
-        message: 'Portfolio reset successfully',
-        deletedCount: deletedCount,
-        userId: user
-      }),
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'DELETE,OPTIONS'
-      },
-    };
+    return ok({ message: 'Portfolio reset successfully', deletedCount, userId: userId }, 200, CORS);
 
   } catch (error) {
     console.error('Portfolio reset error:', error);
-    return {
-      statusCode: 500,
-      body: JSON.stringify({ 
-        error: error.message || 'Failed to reset portfolio'
-      }),
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'DELETE,OPTIONS'
-      },
-    };
+    return err(500, error.message || 'Failed to reset portfolio', CORS);
   }
 };

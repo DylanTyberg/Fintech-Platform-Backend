@@ -4,5 +4,5 @@ import { StockAppStack } from '../lib/serverless_backend-stack';
 
 const app = new cdk.App();
 new StockAppStack(app, 'ServerlessBackendStack', {
-  
+  polygonApiKey: process.env.POLYGON_API_KEY
 });

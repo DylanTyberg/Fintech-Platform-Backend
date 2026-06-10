@@ -1,9 +1,16 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, QueryCommand } from "@aws-sdk/lib-dynamodb";
+import { ok, err } from "/opt/response.mjs";
 
 const client = new DynamoDBClient({});
 const dynamo = DynamoDBDocumentClient.from(client);
 const tableName = 'stock-app-data';
+
+const CORS = {
+  'Access-Control-Allow-Origin':  '*',
+  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Methods': 'GET,OPTIONS',
+};
 
 const getSparklineData = async (symbol) => {
   try {
@@ -18,7 +25,7 @@ const getSparklineData = async (symbol) => {
       ScanIndexForward: true  // Oldest first
     };
 
-    // Get last 30 items (for sparkline)
+    // Get last 60 items (for sparkline)
     const sparklineParams = {
       TableName: tableName,
       KeyConditionExpression: "symbol = :pkvalue",
@@ -60,7 +67,7 @@ const getSparklineData = async (symbol) => {
       symbol,
       prices,
       price: latest.close,
-      percentChange: parseFloat(percentChange.toFixed(2)),  // Round to 2 decimals
+      percentChange: parseFloat(percentChange.toFixed(2)),
     };
   } catch (error) {
     console.error(`❌ Error fetching data for ${symbol}:`, error);
@@ -84,41 +91,15 @@ export const handler = async () => {
     const data = results.filter(item => item !== null);
 
     if (data.length === 0) {
-      return {
-        statusCode: 500,
-        body: JSON.stringify({ error: 'Failed to fetch any stock data' }),
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Headers': 'Content-Type',
-          'Access-Control-Allow-Methods': 'GET,OPTIONS'
-        },
-      };
+      return err(500, 'Failed to fetch any stock data', CORS);
     }
 
     console.log(`✅ Successfully fetched ${data.length}/${symbols.length} symbols`);
 
-    return {
-      statusCode: 200,
-      body: JSON.stringify(data),
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'GET,OPTIONS'
-      },
-    };
+    return ok(data, 200, CORS);
+
   } catch (error) {
     console.error('❌ Lambda error:', error);
-    return {
-      statusCode: 500,
-      body: JSON.stringify({ 
-        error: 'Internal server error',
-        message: error.message 
-      }),
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'GET,OPTIONS'
-      },
-    };
+    return err(500, error.message, CORS);
   }
 };

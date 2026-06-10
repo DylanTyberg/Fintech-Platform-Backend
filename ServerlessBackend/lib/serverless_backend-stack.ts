@@ -5,6 +5,10 @@ import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
 import * as path from 'path';
+import * as cognito from 'aws-cdk-lib/aws-cognito';
+import * as cloudtrail from 'aws-cdk-lib/aws-cloudtrail';
+import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as logs from 'aws-cdk-lib/aws-logs';
 
 export interface StockAppStackProps extends cdk.StackProps {
   polygonApiKey?: string;
@@ -15,10 +19,36 @@ export class StockAppStack extends cdk.Stack {
     super(scope, id, props);
 
     // -----------------------------------------------------------------------
+    // CLOUDTRAIL — Audit logging
+    // -----------------------------------------------------------------------
+    const trailBucket = new s3.Bucket(this, 'CloudTrailBucket', {
+      bucketName: `cloudtrail-logs-${this.account}`,
+      enforceSSL: true,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      versioned: true,
+      lifecycleRules: [{
+        expiration: cdk.Duration.days(365),  
+      }],
+      removalPolicy: cdk.RemovalPolicy.RETAIN, 
+    });
+
+    const trail = new cloudtrail.Trail(this, 'AuditTrail', {
+      trailName: 'fintech-platform-audit',
+      bucket: trailBucket,
+      isMultiRegionTrail: true,
+      enableFileValidation: true,        
+      includeGlobalServiceEvents: true, 
+      sendToCloudWatchLogs: true,     
+      cloudWatchLogsRetention: logs.RetentionDays.ONE_YEAR,
+    });
+
+    // -----------------------------------------------------------------------
     // 1. IMPORT EXISTING RESOURCES
     // -----------------------------------------------------------------------
 
     // Cognito User Pool (existing)
+
 
     // DynamoDB Tables (existing — all imported, not created)
     const marketCacheTable = dynamodb.Table.fromTableName(
@@ -47,27 +77,31 @@ export class StockAppStack extends cdk.Stack {
     // -----------------------------------------------------------------------
     // 3. SHARED LAMBDA CONFIG
     // -----------------------------------------------------------------------
-    const commonEnv = {
-      POLYGON_API_KEY: props.polygonApiKey,
-      MARKET_CACHE_TABLE: marketCacheTable.tableName,
-      DAILY_CACHE_TABLE: dailyCacheTable.tableName,
-      MOVERS_TABLE: moversTable.tableName,
-      USER_DATA_TABLE: userDataTable.tableName,
-      AI_JOBS_TABLE: aiJobsTable.tableName,
-      MARKETAUX_API_KEY: process.env.MARKETAUX_API_KEY ?? '',
-      NEWS_TABLE: newsTable.tableName,
+
+    const sharedLayer = new lambda.LayerVersion(this, 'SharedUtilsLayer', {
+      code: lambda.Code.fromAsset(path.join(__dirname, 'lambdas/shared')),
+      compatibleRuntimes: [lambda.Runtime.NODEJS_20_X],
+      description: 'Shared response helpers',
+    });
+
+    // Table name constants — referenced per-function below
+    const TABLE = {
+      MARKET:    marketCacheTable.tableName,
+      DAILY:     dailyCacheTable.tableName,
+      MOVERS:    moversTable.tableName,
+      USER:      userDataTable.tableName,
+      AI_JOBS:   aiJobsTable.tableName,
+      NEWS:      newsTable.tableName,
     };
 
     const commonProps = {
       runtime: lambda.Runtime.NODEJS_20_X,
       timeout: cdk.Duration.seconds(30),
       memorySize: 256,
-      environment: commonEnv,
+      layers: [sharedLayer],
+      // ← no shared environment block — each function gets only what it needs
     };
 
-    // Helper — creates a Lambda with consistent naming.
-    // All function names get a -v2 suffix to avoid conflicts with the
-    // existing manually-created Lambdas already deployed in this account.
     const mkLambda = (
       id: string,
       functionName: string,
@@ -77,64 +111,91 @@ export class StockAppStack extends cdk.Stack {
       new lambda.Function(this, id, {
         ...commonProps,
         functionName: `${functionName}-v2`,
-        handler: 'index.handler', // each lambda folder contains index.mjs
+        handler: 'index.handler',
         code: lambda.Code.fromAsset(path.join(__dirname, `lambdas/${handlerDir}`)),
         ...overrides,
       } as lambda.FunctionProps);
 
     // -----------------------------------------------------------------------
     // 4. USER LAMBDAS
-    //    GET    /users/get
-    //    PUT    /user
-    //    DELETE /user/watchlist
-    //    DELETE /user/portfolio-reset
     // -----------------------------------------------------------------------
     const stockUsersGetFn = mkLambda(
-      'StockUsersGet', 'stock-users-get', 'stockUsersGet'
-    );
+      'StockUsersGet', 'stock-users-get', 'stockUsersGet', {
+      environment: {
+        USER_DATA_TABLE: TABLE.USER,
+      }
+    });
     userDataTable.grantReadData(stockUsersGetFn);
 
     const stockUsersPutFn = mkLambda(
-      'StockUsersPut', 'stock-users-put', 'stockUsersPut'
-    );
-    userDataTable.grantReadWriteData(stockUsersPutFn);
+      'StockUsersPut', 'stock-users-put', 'stockUsersPut', {
+      environment: {
+        USER_DATA_TABLE: TABLE.USER,
+      }
+    });
+    stockUsersPutFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['dynamodb:PutItem'],
+      resources: [userDataTable.tableArn],
+    }));
 
     const stockWatchlistDeleteFn = mkLambda(
-      'StockWatchlistDelete', 'stock-watchlist-delete', 'stockWatchlistDelete'
-    );
-    userDataTable.grantReadWriteData(stockWatchlistDeleteFn);
+      'StockWatchlistDelete', 'stock-watchlist-delete', 'stockWatchlistDelete', {
+      environment: {
+        USER_DATA_TABLE: TABLE.USER,
+      }
+    });
+    stockWatchlistDeleteFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['dynamodb:DeleteItem'],
+      resources: [userDataTable.tableArn],
+    }));
 
     const stockPortfolioResetFn = mkLambda(
-      'StockPortfolioReset', 'stock-portfolio-reset', 'stockPortfolioReset'
-    );
-    userDataTable.grantReadWriteData(stockPortfolioResetFn);
+      'StockPortfolioReset', 'stock-portfolio-reset', 'stockPortfolioReset', {
+      environment: {
+        USER_DATA_TABLE: TABLE.USER,
+      }
+    });
+    stockPortfolioResetFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: [
+        'dynamodb:Query',         // reads all items for the user
+        'dynamodb:BatchWriteItem', // deletes portfolio items in batches
+      ],
+      resources: [
+        userDataTable.tableArn,
+      ],
+    }));
 
     // -----------------------------------------------------------------------
     // 5. INTRADAY LAMBDAS
-    //    POST /intraday/holdings/prices
-    //    GET  /intraday/latest
-    //    POST /intraday/request
-    //    GET  /intraday/sparkline-market
-    //    POST /intraday/list
     // -----------------------------------------------------------------------
     const stockHoldingsChangeGetFn = mkLambda(
-      'StockHoldingsChangeGet', 'stock-holdings-change-get', 'stockHoldingsChangeGet'
-    );
+      'StockHoldingsChangeGet', 'stock-holdings-change-get', 'stockHoldingsChangeGet', {
+      environment: {
+        MARKET_CACHE_TABLE: TABLE.MARKET,
+        USER_DATA_TABLE:    TABLE.USER,
+      }
+    });
     marketCacheTable.grantReadData(stockHoldingsChangeGetFn);
     userDataTable.grantReadData(stockHoldingsChangeGetFn);
 
-    // Declared before stockLatestPriceGetFn because latest-price-get invokes it on cache miss
     const stockIntradayPutFn = mkLambda(
-      'StockIntradayPut', 'stock-intraday-put', 'stockIntradayPut',
-      { timeout: cdk.Duration.minutes(5) }
-    );
+      'StockIntradayPut', 'stock-intraday-put', 'stockIntradayPut', {
+      timeout: cdk.Duration.minutes(5),
+      environment: {
+        POLYGON_API_KEY:    props.polygonApiKey ?? '',
+        MARKET_CACHE_TABLE: TABLE.MARKET,
+      }
+    });
     marketCacheTable.grantReadWriteData(stockIntradayPutFn);
 
     const stockLatestPriceGetFn = mkLambda(
-      'StockLatestPriceGet', 'stock-latest-price-get', 'stockLatestPriceGet'
-    );
+      'StockLatestPriceGet', 'stock-latest-price-get', 'stockLatestPriceGet', {
+      environment: {
+        MARKET_CACHE_TABLE: TABLE.MARKET,
+        // INTRADAY_PUT_FUNCTION_NAME added below after stockIntradayPutFn is declared
+      }
+    });
     marketCacheTable.grantReadData(stockLatestPriceGetFn);
-    // stock-latest-price-get → stock-intraday-put (sync invoke on cache miss)
     stockLatestPriceGetFn.addToRolePolicy(new iam.PolicyStatement({
       actions: ['lambda:InvokeFunction'],
       resources: [stockIntradayPutFn.functionArn],
@@ -145,92 +206,152 @@ export class StockAppStack extends cdk.Stack {
     );
 
     const stockIntradaySparklineFn = mkLambda(
-      'StockIntradaySparkline', 'stock-intraday-sparkline', 'stockIntradaySparkline'
-    );
+      'StockIntradaySparkline', 'stock-intraday-sparkline', 'stockIntradaySparkline', {
+      environment: {
+        MARKET_CACHE_TABLE: TABLE.MARKET,
+      }
+    });
     marketCacheTable.grantReadData(stockIntradaySparklineFn);
 
     const stockIntradayListGetFn = mkLambda(
-      'StockIntradayListGet', 'stock-intraday-list-get', 'stockIntradayListGet'
-    );
+      'StockIntradayListGet', 'stock-intraday-list-get', 'stockIntradayListGet', {
+      environment: {
+        MARKET_CACHE_TABLE: TABLE.MARKET,
+        USER_DATA_TABLE:    TABLE.USER,
+      }
+    });
     marketCacheTable.grantReadData(stockIntradayListGetFn);
     userDataTable.grantReadData(stockIntradayListGetFn);
 
     // -----------------------------------------------------------------------
     // 6. MOVERS LAMBDAS
-    //    GET  /movers
-    //    POST /movers
     // -----------------------------------------------------------------------
     const stockMoversGetFn = mkLambda(
-      'StockMoversGet', 'stock-movers-get', 'stockMoversGet'
-    );
+      'StockMoversGet', 'stock-movers-get', 'stockMoversGet', {
+      environment: {
+        MOVERS_TABLE: TABLE.MOVERS,
+      }
+    });
     moversTable.grantReadData(stockMoversGetFn);
 
     const stockMoversPutFn = mkLambda(
-      'StockMoversPut', 'stock-movers-put', 'stockMoversPut',
-      { timeout: cdk.Duration.minutes(5) }
-    );
+      'StockMoversPut', 'stock-movers-put', 'stockMoversPut', {
+      timeout: cdk.Duration.minutes(5),
+      environment: {
+        POLYGON_API_KEY: props.polygonApiKey ?? '',
+        MOVERS_TABLE:    TABLE.MOVERS,
+      }
+    });
     moversTable.grantReadWriteData(stockMoversPutFn);
-
 
     // -----------------------------------------------------------------------
     // NEWS LAMBDA
-    //    GET /news?symbols=AAPL,MSFT&type=positive
     // -----------------------------------------------------------------------
     const stockNewsGetFn = mkLambda(
-      'StockNewsGet', 'stock-news-get', 'stockNewsGet'
-    );
+      'StockNewsGet', 'stock-news-get', 'stockNewsGet', {
+      environment: {
+        MARKETAUX_API_KEY: process.env.MARKETAUX_API_KEY ?? '',
+        NEWS_TABLE:        TABLE.NEWS,
+      }
+    });
     newsTable.grantReadWriteData(stockNewsGetFn);
 
     // -----------------------------------------------------------------------
     // 7. DAILY LAMBDAS
-    //    POST /daily
-    //    POST /daily/list
     // -----------------------------------------------------------------------
     const stockDailyPutFn = mkLambda(
-      'StockDailyPut', 'stock-daily-put', 'stockDailyPut',
-      { timeout: cdk.Duration.minutes(5) }
-    );
+      'StockDailyPut', 'stock-daily-put', 'stockDailyPut', {
+      timeout: cdk.Duration.minutes(5),
+      environment: {
+        POLYGON_API_KEY:   props.polygonApiKey ?? '',
+        DAILY_CACHE_TABLE: TABLE.DAILY,
+      }
+    });
     dailyCacheTable.grantReadWriteData(stockDailyPutFn);
 
     const stockDailyGetFn = mkLambda(
-      'StockDailyGet', 'stock-daily-get', 'stockDailyGet'
-    );
+      'StockDailyGet', 'stock-daily-get', 'stockDailyGet', {
+      environment: {
+        DAILY_CACHE_TABLE: TABLE.DAILY,
+        USER_DATA_TABLE:   TABLE.USER,
+      }
+    });
     dailyCacheTable.grantReadData(stockDailyGetFn);
     userDataTable.grantReadData(stockDailyGetFn);
 
     // -----------------------------------------------------------------------
     // 8. AI LAMBDAS
-    //    POST /ai              → stock-ai-job-starter
-    //    GET  /ai/{jobId}      → stock-ai-job-status-checker
-    //    (internal async)      → stock-ai-insight-suggestions  (Bedrock invoker)
     // -----------------------------------------------------------------------
     const stockAiJobStarterFn = mkLambda(
-      'StockAiJobStarter', 'stock-ai-job-starter', 'stockAiJobStarter'
-    );
+      'StockAiJobStarter', 'stock-ai-job-starter', 'stockAiJobStarter', {
+      environment: {
+        AI_JOBS_TABLE: TABLE.AI_JOBS,
+        // INSIGHT_SUGGESTIONS_FUNCTION_NAME added below
+      }
+    });
     aiJobsTable.grantReadWriteData(stockAiJobStarterFn);
+    stockAiJobStarterFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['dynamodb:Query'],
+      resources: [
+        `arn:aws:dynamodb:us-east-1:${this.account}:table/ai-jobs/index/callerIp-createdAt-index`,
+      ],
+    }));
 
     const aiJobStatusCheckerFn = mkLambda(
-      'AiJobStatusChecker', 'stock-ai-job-status-checker', 'aiJobStatusChecker'
-    );
+      'AiJobStatusChecker', 'stock-ai-job-status-checker', 'aiJobStatusChecker', {
+      environment: {
+        AI_JOBS_TABLE: TABLE.AI_JOBS,
+      }
+    });
     aiJobsTable.grantReadData(aiJobStatusCheckerFn);
 
-    // Long-running Bedrock invoker — called async by job starter
     const stockAiInsightSuggestionsFn = mkLambda(
-      'StockAiInsightSuggestions', 'stock-ai-insight-suggestions', 'stockAiInsightSuggestions',
-      { timeout: cdk.Duration.minutes(15), memorySize: 512 }
-    );
+      'StockAiInsightSuggestions', 'stock-ai-insight-suggestions', 'stockAiInsightSuggestions', {
+      timeout: cdk.Duration.minutes(15),
+      memorySize: 512,
+      environment: {
+        AI_JOBS_TABLE:      TABLE.AI_JOBS,
+        USER_DATA_TABLE:    TABLE.USER,
+        MARKET_CACHE_TABLE: TABLE.MARKET,
+        DAILY_CACHE_TABLE:  TABLE.DAILY,
+      }
+    });
     aiJobsTable.grantReadWriteData(stockAiInsightSuggestionsFn);
     userDataTable.grantReadData(stockAiInsightSuggestionsFn);
     marketCacheTable.grantReadData(stockAiInsightSuggestionsFn);
     dailyCacheTable.grantReadData(stockAiInsightSuggestionsFn);
-
-    // Bedrock model access
     stockAiInsightSuggestionsFn.addToRolePolicy(new iam.PolicyStatement({
       actions: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'],
-      resources: ['arn:aws:bedrock:*::foundation-model/anthropic.claude-3-5-sonnet*'],
+      resources: [
+        'arn:aws:bedrock:*::foundation-model/anthropic.claude*',
+        'arn:aws:bedrock:*:*:inference-profile/us.anthropic.claude*',
+      ],
     }));
+    stockAiInsightSuggestionsFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: [
+        'aws-marketplace:ViewSubscriptions',
+        'aws-marketplace:Subscribe',
+        'aws-marketplace:Unsubscribe',
+      ],
+      resources: ['*'],
+    }));
+    // Add after existing stockAiInsightSuggestionsFn permissions
+    stockAiInsightSuggestionsFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['lambda:InvokeFunction'],
+      resources: [
+        stockIntradayListGetFn.functionArn,
+        stockDailyGetFn.functionArn,
+      ],
+    }));
+    stockAiInsightSuggestionsFn.addEnvironment(
+      'INTRADAY_LIST_FUNCTION_NAME',
+      stockIntradayListGetFn.functionName
+    );
+    stockAiInsightSuggestionsFn.addEnvironment(
+      'DAILY_LIST_FUNCTION_NAME',
+      stockDailyGetFn.functionName
+    );
 
-    // Allow job starter to fire insight suggestions asynchronously (Event invocation)
     stockAiJobStarterFn.addToRolePolicy(new iam.PolicyStatement({
       actions: ['lambda:InvokeFunction'],
       resources: [stockAiInsightSuggestionsFn.functionArn],
@@ -242,52 +363,49 @@ export class StockAppStack extends cdk.Stack {
 
     // -----------------------------------------------------------------------
     // 9. EVENTBRIDGE LAMBDAS
-    //
-    //  Schedule type      Name                      Lambda target
-    //  ─────────────────  ────────────────────────  ──────────────────────────
-    //  EB Rule  (cron)    intraday-delete           stock-intraday-delete
-    //                     cron(0 13 ? * MON-FRI *)  UTC — runs at 13:00 UTC weekdays
-    //
-    //  EB Scheduler       Stock-Periodic            stocks-eventbridge
-    //  (fixed rate)       rate(5 minutes)           America/New_York, no market-hour filter
-    //
-    //  EB Scheduler       stock-daily-eventbridge   stock-daily-event-bridge
-    //  (cron)             cron(51 16 ? * MON-FRI *) America/New_York → 16:51 ET weekdays
-    //
-    //  EB Scheduler       Stock-Portfolio-Snapshots stock-portfolio-snapshots
-    //  (cron)             cron(50 16 ? * MON-FRI *) America/New_York → 16:50 ET weekdays
-    //                     Flexible time window: 5 minutes
     // -----------------------------------------------------------------------
-
-    // Lambda: stocks-eventbridge (= Stock-Periodic target)
     const stocksEventBridgeFn = mkLambda(
-      'StocksEventBridge', 'stocks-eventbridge', 'stocksEventBridge',
-      { timeout: cdk.Duration.minutes(5) }
-    );
+      'StocksEventBridge', 'stocks-eventbridge', 'stocksEventBridge', {
+      timeout: cdk.Duration.minutes(5),
+      environment: {
+        POLYGON_API_KEY:    props.polygonApiKey ?? '',
+        MARKET_CACHE_TABLE: TABLE.MARKET,
+        USER_DATA_TABLE:    TABLE.USER,
+      }
+    });
     marketCacheTable.grantReadWriteData(stocksEventBridgeFn);
     userDataTable.grantReadData(stocksEventBridgeFn);
 
-    // Lambda: stock-daily-event-bridge
     const stockDailyEventBridgeFn = mkLambda(
-      'StockDailyEventBridge', 'stock-daily-event-bridge', 'stockDailyEventBridge',
-      { timeout: cdk.Duration.minutes(5) }
-    );
+      'StockDailyEventBridge', 'stock-daily-event-bridge', 'stockDailyEventBridge', {
+      timeout: cdk.Duration.minutes(5),
+      environment: {
+        POLYGON_API_KEY:   props.polygonApiKey ?? '',
+        DAILY_CACHE_TABLE: TABLE.DAILY,
+      }
+    });
     dailyCacheTable.grantReadWriteData(stockDailyEventBridgeFn);
 
-    // Lambda: stock-portfolio-snapshots
     const stockPortfolioSnapshotsFn = mkLambda(
-      'StockPortfolioSnapshots', 'stock-portfolio-snapshots', 'stockPortfolioSnapshots',
-      { timeout: cdk.Duration.minutes(5) }
-    );
+      'StockPortfolioSnapshots', 'stock-portfolio-snapshots', 'stockPortfolioSnapshots', {
+      timeout: cdk.Duration.minutes(5),
+      environment: {
+        USER_DATA_TABLE:    TABLE.USER,
+        MARKET_CACHE_TABLE: TABLE.MARKET,
+        DAILY_CACHE_TABLE:  TABLE.DAILY,
+      }
+    });
     userDataTable.grantReadWriteData(stockPortfolioSnapshotsFn);
     marketCacheTable.grantReadData(stockPortfolioSnapshotsFn);
     dailyCacheTable.grantReadData(stockPortfolioSnapshotsFn);
 
-    // Lambda: stock-intraday-delete
     const stockIntradayDeleteFn = mkLambda(
-      'StockIntradayDelete', 'stock-intraday-delete', 'stockIntradayDelete',
-      { timeout: cdk.Duration.minutes(5) }
-    );
+      'StockIntradayDelete', 'stock-intraday-delete', 'stockIntradayDelete', {
+      timeout: cdk.Duration.minutes(5),
+      environment: {
+        MARKET_CACHE_TABLE: TABLE.MARKET,
+      }
+    });
     marketCacheTable.grantReadWriteData(stockIntradayDeleteFn);
 
     // -----------------------------------------------------------------------
@@ -347,38 +465,94 @@ export class StockAppStack extends cdk.Stack {
         allowMethods: apigateway.Cors.ALL_METHODS,
         allowHeaders: ['Content-Type', 'Authorization'],
       },
-      deployOptions: { stageName: 'prod' },
+      deployOptions: {
+        stageName: 'prod',
+        methodOptions: {
+          '/ai-insight/POST': {
+            throttlingRateLimit: 1,
+            throttlingBurstLimit: 1,
+          },
+        },
+      },
+    });
+
+
+    const securityHeaders = {
+      'Strict-Transport-Security': "'max-age=31536000; includeSubdomains; preload'",
+      'X-Content-Type-Options':    "'nosniff'",
+      'X-Frame-Options':           "'DENY'",
+      'X-XSS-Protection':          "'1; mode=block'",
+      'Referrer-Policy':           "'strict-origin-when-cross-origin'",
+    };
+
+    // Covers 4XX errors (including 401 Unauthorized, 403 Forbidden)
+    new apigateway.GatewayResponse(this, 'GatewayResponse4xx', {
+      restApi: api,
+      type: apigateway.ResponseType.DEFAULT_4XX,
+      responseHeaders: securityHeaders,
+    });
+
+    // Covers 5XX errors
+    new apigateway.GatewayResponse(this, 'GatewayResponse5xx', {
+      restApi: api,
+      type: apigateway.ResponseType.DEFAULT_5XX,
+      responseHeaders: securityHeaders,
+    });
+
+    // ── Cognito Authorizer ───────────────────────────────────────────────────────
+    const userPool = cognito.UserPool.fromUserPoolId(
+      this,
+      'ImportedUserPool',
+      'us-east-1_9VbCwStHJ',
+    );
+
+    const cognitoAuthorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'CognitoAuthorizer', {
+      cognitoUserPools: [userPool],
+      identitySource: 'method.request.header.Authorization',
+    });
+
+    const cfnAuthorizer = cognitoAuthorizer.node.defaultChild as apigateway.CfnAuthorizer;
+    cfnAuthorizer.authorizerResultTtlInSeconds = 300;
+    cfnAuthorizer.identityValidationExpression = '^Bearer [-0-9a-zA-Z._]*$';
+
+    const auth = {
+      authorizer: cognitoAuthorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    };
+
+    // ── Usage Plan (rate limiting) ───────────────────────────────────────────────
+    const usagePlan = api.addUsagePlan('PublicUsagePlan', {
+      name: 'PublicRateLimit',
+      throttle: {
+        rateLimit: 1,    // 5 requests per second steady state
+        burstLimit: 2,   // no burst headroom — hard ceiling at 5
+      },
+      quota: {
+        limit: 50,
+        period: apigateway.Period.DAY,
+      },
+    });
+
+    usagePlan.addApiStage({
+      stage: api.deploymentStage,
     });
 
 
     const int = (fn: lambda.Function) => new apigateway.LambdaIntegration(fn);
 
-    // ── /user ────────────────────────────────────────────────────────────────
-    // GET    /user              → stock-users-get
-    // PUT    /user              → stock-users-put
-    // DELETE /user/watchlist    → stock-watchlist-delete
-    // DELETE /user/portfolio-reset → stock-portfolio-reset
+    // ── /user ── ALL require auth ─────────────────────────────────────────────────
     const userRes = api.root.addResource('user');
-    userRes.addMethod('GET', int(stockUsersGetFn));
-    userRes.addMethod('PUT', int(stockUsersPutFn));
-    userRes.addResource('watchlist').addMethod('DELETE', int(stockWatchlistDeleteFn));
-    userRes.addResource('portfolio-reset').addMethod('DELETE', int(stockPortfolioResetFn));
+    userRes.addMethod('GET', int(stockUsersGetFn), auth);
+    userRes.addMethod('PUT', int(stockUsersPutFn), auth);
+    userRes.addResource('watchlist').addMethod('DELETE', int(stockWatchlistDeleteFn), auth);
+    userRes.addResource('portfolio-reset').addMethod('DELETE', int(stockPortfolioResetFn), auth);
 
-    // ── /name ─────────────────────────────────────────────────────────────────
-    // GET /name  (TODO: confirm lambda)
-    // PUT /name  (TODO: confirm lambda)
+    // ── /name ── requires auth ────────────────────────────────────────────────────
     const nameRes = api.root.addResource('name');
-    nameRes.addMethod('GET', int(stockUsersGetFn));
-    nameRes.addMethod('PUT', int(stockUsersPutFn));
+    nameRes.addMethod('GET', int(stockUsersGetFn), auth);
+    nameRes.addMethod('PUT', int(stockUsersPutFn), auth);
 
-    // ── /intraday ─────────────────────────────────────────────────────────────
-    // GET  /intraday                  → stock-latest-price-get  (TODO: confirm)
-    // POST /intraday                  → stock-intraday-put      (TODO: confirm)
-    // POST /intraday/holdings-prices  → stock-holdings-change-get
-    // GET  /intraday/latest           → stock-latest-price-get
-    // POST /intraday/request          → stock-intraday-put
-    // GET  /intraday/sparkline-market → stock-intraday-sparkline
-    // POST /intraday/list             → stock-intraday-list-get
+    // ── /intraday ── public (market data) ─────────────────────────────────────────
     const intradayRes = api.root.addResource('intraday');
     intradayRes.addMethod('GET', int(stockLatestPriceGetFn));
     intradayRes.addMethod('POST', int(stockIntradayPutFn));
@@ -388,37 +562,27 @@ export class StockAppStack extends cdk.Stack {
     intradayRes.addResource('sparkline-market').addMethod('GET', int(stockIntradaySparklineFn));
     intradayRes.addResource('list').addMethod('POST', int(stockIntradayListGetFn));
 
-    // ── /movers ───────────────────────────────────────────────────────────────
-    // GET  /movers → stock-movers-get
-    // POST /movers → stock-movers-put
+    // ── /movers ── public ─────────────────────────────────────────────────────────
     const moversRes = api.root.addResource('movers');
     moversRes.addMethod('GET', int(stockMoversGetFn));
     moversRes.addMethod('POST', int(stockMoversPutFn));
 
-    // ── /news ─────────────────────────────────────────────────────────────────
-    // GET /news?symbols=AAPL,MSFT&type=positive
+    // ── /news ── public ───────────────────────────────────────────────────────────
     const newsRes = api.root.addResource('news');
     newsRes.addMethod('GET', int(stockNewsGetFn));
 
-    // ── /daily ────────────────────────────────────────────────────────────────
-    // GET  /daily       → stock-daily-get  (TODO: confirm)
-    // POST /daily       → stock-daily-put
-    // POST /daily/list  → stock-daily-get
+    // ── /daily ── public ──────────────────────────────────────────────────────────
     const dailyRes = api.root.addResource('daily');
     dailyRes.addMethod('GET', int(stockDailyGetFn));
     dailyRes.addMethod('POST', int(stockDailyPutFn));
     dailyRes.addResource('list').addMethod('POST', int(stockDailyGetFn));
 
-    // ── /ai-insight ───────────────────────────────────────────────────────────
-    // GET  /ai-insight                   → stock-ai-job-status-checker (TODO: confirm)
-    // POST /ai-insight                   → stock-ai-job-starter
-    // GET  /ai-insight/{jobId}           → stock-ai-job-status-checker
-    // GET  /ai-insight/portfolio-summary → stock-ai-insight-suggestions (TODO: confirm)
+    // ── /ai-insight ── POST/GET public (freemium), portfolio-summary requires auth ─
     const aiRes = api.root.addResource('ai-insight');
     aiRes.addMethod('GET', int(aiJobStatusCheckerFn));
     aiRes.addMethod('POST', int(stockAiJobStarterFn));
     aiRes.addResource('{jobId}').addMethod('GET', int(aiJobStatusCheckerFn));
-    aiRes.addResource('portfolio-summary').addMethod('GET', int(stockAiInsightSuggestionsFn));
+    aiRes.addResource('portfolio-summary').addMethod('GET', int(stockAiInsightSuggestionsFn), auth);
 
 
     // -----------------------------------------------------------------------

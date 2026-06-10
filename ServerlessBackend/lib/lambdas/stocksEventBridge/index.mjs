@@ -1,7 +1,7 @@
 import https from 'https';
 import { DynamoDBClient, BatchWriteItemCommand, ScanCommand } from '@aws-sdk/client-dynamodb';
 import { unmarshall } from "@aws-sdk/util-dynamodb";
-
+import { ok, err } from "/opt/response.mjs";
 
 const dynamodb = new DynamoDBClient({});
 const tableName = 'stock-app-data';
@@ -19,7 +19,7 @@ const fetchPolygonData = (symbol, from, to, apiKey) => {
         try {
           const data = JSON.parse(body);
           //console.log(`Polygon raw response for ${symbol}:`, JSON.stringify(data));
-          if ((data.status !== 'OK' && data.status !=='DELAYED') || !data.results) {
+          if ((data.status !== 'OK' && data.status !== 'DELAYED') || !data.results) {
             reject(new Error('Invalid data or no data available'));
           } else {
             resolve(data);
@@ -34,11 +34,9 @@ const fetchPolygonData = (symbol, from, to, apiKey) => {
   });
 };
 
-
 const getSymbols = async () => {
   const params = {
     TableName: "stock-user-data",
-    // Must use ExpressionAttributeValues with DynamoDB types
     FilterExpression: "begins_with(#type, :watchlistPrefix) OR begins_with(#type, :holdingPrefix)",
     ExpressionAttributeNames: {
       "#type": "type"
@@ -55,14 +53,13 @@ const getSymbols = async () => {
     const symbols = new Set();
 
     for (const rawItem of result.Items ?? []) {
-      const item = unmarshall(rawItem);   // convert {S:""} → normal JS
+      const item = unmarshall(rawItem);
       const symbol = item.type.split("#")[1];
       symbols.add(symbol);
     }
-    console.log("Symbols:", symbols)
+    console.log("Symbols:", symbols);
 
     return Array.from(symbols);
-
 
   } catch (error) {
     console.error("Error getting symbols:", error);
@@ -74,10 +71,10 @@ export const handler = async (event) => {
   const userSymbols = await getSymbols();
   const indices = ['SPY', 'DIA', 'QQQ'];
   const sectors = ['XLK', 'XLE', 'XLF', 'XLV', 'XLI', 'XLB', 'XLU', 'XLY', 'XLP', 'XLRE', 'XLC'];
-  
+
   // Combine all symbols and remove duplicates
   const symbols = [...new Set([...userSymbols, ...indices, ...sectors])];
-  const apiKey = 'TlYNfcSis7sJMHlwCKfwzpg7cuZlubpU';
+  const apiKey = process.env.POLYGON_API_KEY;
 
   const easternTime = new Date(
     new Date().toLocaleString("en-US", { timeZone: "America/New_York" })
@@ -89,25 +86,18 @@ export const handler = async (event) => {
 
   // Skip weekends
   if (day === 0 || day === 6) {
-    return {
-      statusCode: 200,
-      body: JSON.stringify({ message: "Market closed (weekend)" }),
-    };
+    return ok({ message: "Market closed (weekend)" });
   }
 
   // Skip outside 9:00 AM–4:30 PM Eastern
   if (hour < 9 || (hour === 9 && minute < 15) || (hour === 16 && minute > 45) || hour > 16) {
-    return {
-      statusCode: 200,
-      body: JSON.stringify({ message: "Market closed (off hours)" }),
-    };
+    return ok({ message: "Market closed (off hours)" });
   }
 
   // Define timestamps (in seconds)
   const currentTimeSec = Math.floor(Date.now() / 1000);
   const to = currentTimeSec - 15 * 60; // 15 minutes ago
   const from = to - 5 * 60;            // 20 to 15 minutes ago
-
 
   for (const symbol of symbols) {
     try {
@@ -124,7 +114,7 @@ export const handler = async (event) => {
       const items = [];
 
       for (const bar of bars) {
-        const timestamp = new Date(bar.t).toISOString(); // Polygon timestamp in ms
+        const timestamp = new Date(bar.t).toISOString();
 
         items.push({
           PutRequest: {
@@ -145,14 +135,7 @@ export const handler = async (event) => {
       // Batch write in chunks of 25
       for (let i = 0; i < items.length; i += BATCH_SIZE) {
         const batch = items.slice(i, i + BATCH_SIZE);
-
-        const params = {
-          RequestItems: {
-            [tableName]: batch
-          }
-        };
-
-        await dynamodb.send(new BatchWriteItemCommand(params));
+        await dynamodb.send(new BatchWriteItemCommand({ RequestItems: { [tableName]: batch } }));
       }
 
     } catch (error) {
@@ -160,8 +143,5 @@ export const handler = async (event) => {
     }
   }
 
-  return {
-    statusCode: 200,
-    body: JSON.stringify({ message: "Data stored in DynamoDB successfully for all symbols." }),
-  };
+  return ok({ message: "Data stored in DynamoDB successfully for all symbols." });
 };

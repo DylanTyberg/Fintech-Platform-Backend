@@ -1,10 +1,17 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, QueryCommand } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
+import { ok, err } from "/opt/response.mjs";
 
 const lambda = new LambdaClient();
 const client = new DynamoDBClient({});
 const dynamo = DynamoDBDocumentClient.from(client);
+
+const CORS = {
+  'Access-Control-Allow-Origin':  '*',
+  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Methods': 'GET,OPTIONS',
+};
 
 const isMarketOpen = () => {
   const easternTime = new Date(
@@ -32,31 +39,14 @@ const getMarketCloseTime = () => {
 };
 
 export const handler = async (event) => {
-  // Handle OPTIONS preflight
   if (event.httpMethod === 'OPTIONS') {
-    return {
-      statusCode: 200,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'GET,OPTIONS'
-      },
-      body: ''
-    };
+    return ok(null, 200, CORS);
   }
 
   const symbol = event.queryStringParameters?.symbol;
 
   if (!symbol) {
-    return {
-      statusCode: 400,
-      body: JSON.stringify({ error: "Symbol parameter is required" }),
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'GET,OPTIONS'
-      }
-    };
+    return err(400, "Symbol parameter is required", CORS);
   }
 
   const params = {
@@ -74,12 +64,12 @@ export const handler = async (event) => {
     console.log("Initial query:", data.Items);
 
     const twentyMinutes = 20 * 60 * 1000;
-    
-    const isStale = data.Items && data.Items.length > 0 
+
+    const isStale = data.Items && data.Items.length > 0
       ? (() => {
           const dataTime = new Date(data.Items[0].timestamp).getTime();
           const currentTime = Date.now();
-          
+
           if (isMarketOpen()) {
             // During market hours: data is stale if older than 20 minutes
             return (currentTime - dataTime) > twentyMinutes;
@@ -92,42 +82,23 @@ export const handler = async (event) => {
       : true;
 
     if (!data.Items || data.Items.length === 0 || isStale) {
-      // Check if we should even try to fetch (don't fetch if market closed for >20 min)
       const currentTime = Date.now();
       const marketCloseTime = getMarketCloseTime();
-      
+
       if (!isMarketOpen() && (currentTime - marketCloseTime) > twentyMinutes) {
         // Market closed for more than 20 minutes
         if (data.Items && data.Items.length > 0) {
           // Return stale data rather than fetching (market is closed)
-          return {
-            statusCode: 200,
-            body: JSON.stringify(data.Items[0]),
-            headers: {
-              'Access-Control-Allow-Origin': '*',
-              'Access-Control-Allow-Headers': 'Content-Type',
-              'Access-Control-Allow-Methods': 'GET,OPTIONS'
-            },
-          };
+          return ok(data.Items[0], 200, CORS);
         } else {
           // No data at all and market is closed
-          return {
-            statusCode: 404,
-            body: JSON.stringify({ error: "No data available - market is closed" }),
-            headers: {
-              'Access-Control-Allow-Origin': '*',
-              'Access-Control-Allow-Headers': 'Content-Type',
-              'Access-Control-Allow-Methods': 'GET,OPTIONS'
-            }
-          };
+          return err(404, "No data available - market is closed", CORS);
         }
       }
 
       // Market is open or recently closed - fetch fresh data
       const payload = {
-        queryStringParameters: {
-          symbol: symbol
-        }
+        queryStringParameters: { symbol }
       };
 
       const lambda_params = {
@@ -145,29 +116,13 @@ export const handler = async (event) => {
       // Check for Lambda errors
       if (lambdaResponse.FunctionError) {
         console.error("Lambda execution error:", responsePayload);
-        
+
         // Return stale data if available, otherwise error
         if (data.Items && data.Items.length > 0) {
-          return {
-            statusCode: 200,
-            body: JSON.stringify(data.Items[0]),
-            headers: {
-              'Access-Control-Allow-Origin': '*',
-              'Access-Control-Allow-Headers': 'Content-Type',
-              'Access-Control-Allow-Methods': 'GET,OPTIONS'
-            },
-          };
+          return ok(data.Items[0], 200, CORS);
         }
-        
-        return {
-          statusCode: 500,
-          body: JSON.stringify({ error: "Failed to fetch fresh data" }),
-          headers: {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': 'Content-Type',
-            'Access-Control-Allow-Methods': 'GET,OPTIONS'
-          }
-        };
+
+        return err(500, "Failed to fetch fresh data", CORS);
       }
 
       // Query again after Lambda execution
@@ -175,48 +130,17 @@ export const handler = async (event) => {
       console.log("New data after Lambda:", new_data.Items);
 
       if (!new_data.Items || new_data.Items.length === 0) {
-        return {
-          statusCode: 404,
-          body: JSON.stringify({ error: "No data available for symbol" }),
-          headers: {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': 'Content-Type',
-            'Access-Control-Allow-Methods': 'GET,OPTIONS'
-          }
-        };
+        return err(404, "No data available for symbol", CORS);
       }
 
-      return {
-        statusCode: 200,
-        body: JSON.stringify(new_data.Items[0]),
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Headers': 'Content-Type',
-          'Access-Control-Allow-Methods': 'GET,OPTIONS'
-        },
-      };
+      return ok(new_data.Items[0], 200, CORS);
     }
 
     // Data is fresh, return it
-    return {
-      statusCode: 200,
-      body: JSON.stringify(data.Items[0]),
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'GET,OPTIONS'
-      },
-    };
+    return ok(data.Items[0], 200, CORS);
+
   } catch (error) {
     console.error("Error:", error);
-    return {
-      statusCode: 500,
-      body: JSON.stringify({ error: error.message }),
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'GET,OPTIONS'
-      },
-    };
+    return err(500, error.message, CORS);
   }
 };
