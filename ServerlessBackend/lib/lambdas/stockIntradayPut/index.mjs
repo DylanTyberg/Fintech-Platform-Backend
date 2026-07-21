@@ -3,7 +3,7 @@ import { DynamoDBClient, BatchWriteItemCommand, QueryCommand } from '@aws-sdk/cl
 import { ok, err } from "/opt/response.mjs";
 
 const dynamodb = new DynamoDBClient({});
-const tableName = 'stock-app-data';
+const tableName = process.env.MARKET_CACHE_TABLE || 'stock-app-data';
 
 const CORS = {
   'Access-Control-Allow-Origin':  '*',
@@ -11,11 +11,11 @@ const CORS = {
   'Access-Control-Allow-Methods': 'OPTIONS,POST,GET',
 };
 
-const fetchPolygonData = (symbol, from, to, apiKey) => {
-  const url = `https://api.polygon.io/v2/aggs/ticker/${symbol}/range/1/minute/${from}/${to}?adjusted=true&sort=asc&limit=50000&apiKey=${apiKey}`;
+const fetchPolygonData = (symbol, fromMs, toMs, apiKey) => {
+  const url = `https://api.polygon.io/v2/aggs/ticker/${symbol}/range/1/minute/${fromMs}/${toMs}?adjusted=true&sort=asc&limit=50000&apiKey=${apiKey}`;
 
-  console.log("from", new Date(from * 1000).toISOString());
-  console.log("to", new Date(to * 1000).toISOString());
+  console.log("from", new Date(fromMs).toISOString());
+  console.log("to", new Date(toMs).toISOString());
 
   return new Promise((resolve, reject) => {
     https.get(url, (response) => {
@@ -26,9 +26,8 @@ const fetchPolygonData = (symbol, from, to, apiKey) => {
       response.on('end', () => {
         try {
           const data = JSON.parse(body);
-          //console.log(`Polygon raw response for ${symbol}:`, JSON.stringify(data));
           if ((data.status !== 'OK' && data.status !== 'DELAYED') || !data.results) {
-            reject(new Error('Invalid data or no data available'));
+            reject(new Error(`Invalid data or no data available: ${JSON.stringify(data)}`));
           } else {
             resolve(data);
           }
@@ -47,7 +46,11 @@ export const handler = async (event) => {
     return ok(null, 200, CORS);
   }
 
-  const symbol = event.queryStringParameters.symbol;
+  const symbol = event.queryStringParameters?.symbol;
+  if (!symbol) {
+    return err(400, "Symbol parameter is required", CORS);
+  }
+
   const apiKey = process.env.POLYGON_API_KEY;
 
   const checkDatabaseParams = {
@@ -60,88 +63,82 @@ export const handler = async (event) => {
     Limit: 1,
   };
 
+  let lastItemTimestampMs = null;
+
   try {
     const checkDatabaseResponse = await dynamodb.send(new QueryCommand(checkDatabaseParams));
-    let lastItemTimestamp;
     if (checkDatabaseResponse.Items.length > 0) {
-      const lastItem = checkDatabaseResponse.Items[checkDatabaseResponse.Items.length - 1];
-      lastItemTimestamp = new Date(lastItem.timestamp.S);
+      lastItemTimestampMs = new Date(checkDatabaseResponse.Items[0].timestamp.S).getTime();
     }
-
-    try {
-      let from;
-      if (lastItemTimestamp) {
-        from = Math.floor(lastItemTimestamp.getTime() / 1000);
-      } else {
-        // Go back 24 hours from now
-        const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
-        from = Math.floor(twentyFourHoursAgo / 1000);
-      }
-
-      const now = new Date();
-
-      // Create date for 4:30 PM ET (which is 9:30 PM UTC in EST, 8:30 PM UTC in EDT)
-      const marketClose = new Date();
-      marketClose.setUTCHours(21, 30, 0, 0); // 4:30 PM ET = 9:30 PM UTC (EST)
-
-      // If we're before 4:30 PM ET today, go to yesterday
-      if (now < marketClose) {
-        marketClose.setUTCDate(marketClose.getUTCDate() - 1);
-      }
-
-      // Handle weekends
-      const dayOfWeek = marketClose.getUTCDay();
-      if (dayOfWeek === 0) { // Sunday
-        marketClose.setUTCDate(marketClose.getUTCDate() - 2);
-      } else if (dayOfWeek === 6) { // Saturday
-        marketClose.setUTCDate(marketClose.getUTCDate() - 1);
-      }
-
-      const to = Math.floor(marketClose.getTime() / 1000);
-      const data = await fetchPolygonData(symbol, from, to, apiKey);
-
-      const bars = data.results;
-
-      if (!bars || bars.length === 0) {
-        console.log(`No new data for symbol ${symbol}`);
-        return ok({ message: "No new data available." }, 200, CORS);
-      }
-
-      const BATCH_SIZE = 25;
-      const items = [];
-
-      for (const bar of bars) {
-        const timestamp = new Date(bar.t).toISOString();
-
-        items.push({
-          PutRequest: {
-            Item: {
-              symbol: { S: symbol },
-              timestamp: { S: timestamp },
-              category: { S: "intraday" },
-              open: { N: bar.o.toString() },
-              high: { N: bar.h.toString() },
-              low: { N: bar.l.toString() },
-              close: { N: bar.c.toString() },
-              volume: { N: bar.v.toString() },
-            }
-          }
-        });
-      }
-
-      // Batch write in chunks of 25
-      for (let i = 0; i < items.length; i += BATCH_SIZE) {
-        const batch = items.slice(i, i + BATCH_SIZE);
-        await dynamodb.send(new BatchWriteItemCommand({ RequestItems: { [tableName]: batch } }));
-      }
-
-    } catch (error) {
-      console.log(JSON.stringify({ message: `Error fetching or storing data for ${symbol}`, error: error.message }));
-    }
-
   } catch (error) {
     console.log(JSON.stringify({ message: "Error checking database", error: error.message }));
+    return err(500, `Error checking database for ${symbol}: ${error.message}`, CORS);
   }
 
-  return ok({ message: "Data stored in DynamoDB successfully for all symbols." }, 200, CORS);
+  // `to` is always "now" — never a computed market-close cutoff. Asking
+  // Polygon for bars "up to right now" is always a valid range; there's
+  // no scenario where that produces from > to.
+  //
+  // `from` is the last cached bar if we have one (incremental fetch), or
+  // a generous 5-day lookback for a symbol that's never been cached
+  // before — wide enough to comfortably cover a weekend or a short
+  // holiday run without needing to compute which day the market was
+  // actually last open (that day-of-week backtracking is exactly what
+  // produced the inverted range this replaces).
+  const now = Date.now();
+  const from = lastItemTimestampMs ?? (now - 5 * 24 * 60 * 60 * 1000);
+  const to = now;
+
+  try {
+    const data = await fetchPolygonData(symbol, from, to, apiKey);
+    const bars = data.results;
+
+    if (!bars || bars.length === 0) {
+      console.log(`No new data for symbol ${symbol}`);
+      return ok({ message: "No new data available." }, 200, CORS);
+    }
+
+    const BATCH_SIZE = 25;
+    const items = bars.map((bar) => ({
+      PutRequest: {
+        Item: {
+          symbol: { S: symbol },
+          timestamp: { S: new Date(bar.t).toISOString() },
+          category: { S: "intraday" },
+          open: { N: bar.o.toString() },
+          high: { N: bar.h.toString() },
+          low: { N: bar.l.toString() },
+          close: { N: bar.c.toString() },
+          volume: { N: bar.v.toString() },
+        }
+      }
+    }));
+
+    for (let i = 0; i < items.length; i += BATCH_SIZE) {
+      const batch = items.slice(i, i + BATCH_SIZE);
+      await dynamodb.send(new BatchWriteItemCommand({ RequestItems: { [tableName]: batch } }));
+    }
+
+    return ok({
+      message: `Stored ${items.length} bars for ${symbol}.`,
+      latest: {
+        symbol,
+        timestamp: new Date(bars[bars.length - 1].t).toISOString(),
+        category: "intraday",
+        open: bars[bars.length - 1].o,
+        high: bars[bars.length - 1].h,
+        low: bars[bars.length - 1].l,
+        close: bars[bars.length - 1].c,
+        volume: bars[bars.length - 1].v,
+      },
+    }, 200, CORS);
+
+  } catch (error) {
+    // Was: log and fall through to an unconditional "success" response —
+    // exactly what let the from>to bug go unnoticed. Now surfaces as a
+    // real error so a failure here isn't silently indistinguishable from
+    // "market's just quiet right now."
+    console.log(JSON.stringify({ message: `Error fetching or storing data for ${symbol}`, error: error.message }));
+    return err(502, `Failed to fetch data for ${symbol}: ${error.message}`, CORS);
+  }
 };

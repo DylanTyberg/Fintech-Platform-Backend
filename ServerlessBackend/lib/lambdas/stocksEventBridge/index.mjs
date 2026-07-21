@@ -69,7 +69,7 @@ const getSymbols = async () => {
 
 export const handler = async (event) => {
   const userSymbols = await getSymbols();
-  const indices = ['SPY', 'DIA', 'QQQ'];
+  const indices = ['SPY', 'DIA', 'QQQ', ];
   const sectors = ['XLK', 'XLE', 'XLF', 'XLV', 'XLI', 'XLB', 'XLU', 'XLY', 'XLP', 'XLRE', 'XLC'];
 
   // Combine all symbols and remove duplicates

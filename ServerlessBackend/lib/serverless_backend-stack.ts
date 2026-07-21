@@ -165,6 +165,16 @@ export class StockAppStack extends cdk.Stack {
       ],
     }));
 
+    const stockPortfolioAnalyticsFn = mkLambda(
+      'StockPortfolioAnalytics', 'portfolio-analytics', 'portfolioAnalyticsLambda', {
+      environment: {
+        USER_DATA_TABLE: TABLE.USER,
+        DAILY_TABLE: TABLE.DAILY,
+      }
+    });
+    userDataTable.grantReadData(stockPortfolioAnalyticsFn);
+    dailyCacheTable.grantReadWriteData(stockPortfolioAnalyticsFn); // Query for history, BatchWriteItem via ensureDailyDataFresh
+
     // -----------------------------------------------------------------------
     // 5. INTRADAY LAMBDAS
     // -----------------------------------------------------------------------
@@ -484,19 +494,22 @@ export class StockAppStack extends cdk.Stack {
       'X-XSS-Protection':          "'1; mode=block'",
       'Referrer-Policy':           "'strict-origin-when-cross-origin'",
     };
+    const gatewayCorsHeaders = {
+      'Access-Control-Allow-Origin':  "'*'",
+      'Access-Control-Allow-Headers': "'Content-Type,Authorization'",
+      'Access-Control-Allow-Methods': "'OPTIONS,GET,POST,PUT,DELETE'",
+    };
 
-    // Covers 4XX errors (including 401 Unauthorized, 403 Forbidden)
     new apigateway.GatewayResponse(this, 'GatewayResponse4xx', {
       restApi: api,
       type: apigateway.ResponseType.DEFAULT_4XX,
-      responseHeaders: securityHeaders,
+      responseHeaders: { ...securityHeaders, ...gatewayCorsHeaders },
     });
 
-    // Covers 5XX errors
     new apigateway.GatewayResponse(this, 'GatewayResponse5xx', {
       restApi: api,
       type: apigateway.ResponseType.DEFAULT_5XX,
-      responseHeaders: securityHeaders,
+      responseHeaders: { ...securityHeaders, ...gatewayCorsHeaders },
     });
 
     // ── Cognito Authorizer ───────────────────────────────────────────────────────
@@ -506,14 +519,14 @@ export class StockAppStack extends cdk.Stack {
       'us-east-1_9VbCwStHJ',
     );
 
-    const cognitoAuthorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'CognitoAuthorizer', {
+    const cognitoAuthorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'CognitoAuthorizerV4', {
       cognitoUserPools: [userPool],
       identitySource: 'method.request.header.Authorization',
     });
 
     const cfnAuthorizer = cognitoAuthorizer.node.defaultChild as apigateway.CfnAuthorizer;
     cfnAuthorizer.authorizerResultTtlInSeconds = 300;
-    cfnAuthorizer.identityValidationExpression = '^Bearer [-0-9a-zA-Z._]*$';
+    //cfnAuthorizer.identityValidationExpression = '^Bearer [-0-9a-zA-Z._]*$';
 
     const auth = {
       authorizer: cognitoAuthorizer,
@@ -546,6 +559,7 @@ export class StockAppStack extends cdk.Stack {
     userRes.addMethod('PUT', int(stockUsersPutFn), auth);
     userRes.addResource('watchlist').addMethod('DELETE', int(stockWatchlistDeleteFn), auth);
     userRes.addResource('portfolio-reset').addMethod('DELETE', int(stockPortfolioResetFn), auth);
+    userRes.addResource('portfolio-analytics').addMethod('GET', int(stockPortfolioAnalyticsFn), auth);
 
     // ── /name ── requires auth ────────────────────────────────────────────────────
     const nameRes = api.root.addResource('name');

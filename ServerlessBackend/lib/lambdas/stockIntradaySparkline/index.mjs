@@ -77,7 +77,7 @@ const getSparklineData = async (symbol) => {
 
 export const handler = async () => {
   const symbols = [
-    'SPY', 'DIA', 'QQQ',  // Indices
+    'SPY', 'DIA', 'QQQ', 'IWM',  // Indices
     'XLK', 'XLE', 'XLF', 'XLV', 'XLI', 'XLB', 'XLU', 'XLY', 'XLP', 'XLRE', 'XLC'  // Sectors
   ];
 

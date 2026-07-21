@@ -7,6 +7,8 @@ const lambda = new LambdaClient();
 const client = new DynamoDBClient({});
 const dynamo = DynamoDBDocumentClient.from(client);
 
+const TABLE = process.env.MARKET_CACHE_TABLE;
+
 const CORS = {
   'Access-Control-Allow-Origin':  '*',
   'Access-Control-Allow-Headers': 'Content-Type',
@@ -21,21 +23,43 @@ const isMarketOpen = () => {
   const hour = easternTime.getHours();
   const minute = easternTime.getMinutes();
 
-  // Weekend
   if (day === 0 || day === 6) return false;
-
-  // Before 9:30 AM or after 4:00 PM Eastern
   if (hour < 9 || (hour === 9 && minute < 30) || hour >= 16) return false;
-
   return true;
 };
 
-const getMarketCloseTime = () => {
-  const easternTime = new Date(
-    new Date().toLocaleString("en-US", { timeZone: "America/New_York" })
-  );
-  easternTime.setHours(16, 0, 0, 0); // 4:00 PM ET
-  return easternTime.getTime();
+const fetchFreshData = async (symbol) => {
+  const payload = { queryStringParameters: { symbol } };
+  const lambdaResponse = await lambda.send(new InvokeCommand({
+    FunctionName: process.env.INTRADAY_PUT_FUNCTION_NAME,
+    InvocationType: "RequestResponse",
+    Payload: JSON.stringify(payload),
+  }));
+
+  if (lambdaResponse.FunctionError) {
+    // Only fires if intraday-put actually threw/crashed — a normal
+    // err(...) response does NOT set this, which is why this check alone
+    // was never enough to detect a failed fetch.
+    const responsePayload = JSON.parse(Buffer.from(lambdaResponse.Payload).toString());
+    console.error("Intraday-put crashed:", JSON.stringify(responsePayload));
+    return null;
+  }
+
+  const responsePayload = JSON.parse(Buffer.from(lambdaResponse.Payload).toString());
+  console.log(JSON.stringify({ message: "Intraday-put response", symbol, responsePayload }));
+
+  if (responsePayload.statusCode && responsePayload.statusCode >= 400) {
+    console.error(`Intraday-put returned an error for ${symbol}:`, responsePayload.body);
+    return null;
+  }
+
+  const body = typeof responsePayload.body === 'string'
+    ? JSON.parse(responsePayload.body)
+    : responsePayload.body;
+
+  // Use what intraday-put actually just fetched and wrote, directly —
+  // no second DB read, so nothing to race against eventual consistency.
+  return body?.latest ?? null;
 };
 
 export const handler = async (event) => {
@@ -44,100 +68,58 @@ export const handler = async (event) => {
   }
 
   const symbol = event.queryStringParameters?.symbol;
-
   if (!symbol) {
     return err(400, "Symbol parameter is required", CORS);
   }
 
-  const params = {
-    TableName: "stock-app-data",
+  const queryParams = {
+    TableName: TABLE,
     KeyConditionExpression: "symbol = :symbol",
-    ExpressionAttributeValues: {
-      ":symbol": symbol
-    },
+    ExpressionAttributeValues: { ":symbol": symbol },
     ScanIndexForward: false,
     Limit: 1,
   };
 
+  console.log(JSON.stringify({ message: "Querying for latest price", symbol, table: TABLE }));
+
   try {
-    const data = await dynamo.send(new QueryCommand(params));
-    console.log("Initial query:", data.Items);
+    const data = await dynamo.send(new QueryCommand(queryParams));
+    const hasData = data.Items && data.Items.length > 0;
+    console.log(JSON.stringify({ message: "Query result", symbol, table: TABLE, hasData, itemCount: data.Items?.length ?? 0 }));
 
-    const twentyMinutes = 20 * 60 * 1000;
-
-    const isStale = data.Items && data.Items.length > 0
-      ? (() => {
-          const dataTime = new Date(data.Items[0].timestamp).getTime();
-          const currentTime = Date.now();
-
-          if (isMarketOpen()) {
-            // During market hours: data is stale if older than 20 minutes
-            return (currentTime - dataTime) > twentyMinutes;
-          } else {
-            // After hours: data is stale if it's from before market close
-            const marketCloseTime = getMarketCloseTime();
-            return dataTime < marketCloseTime;
-          }
-        })()
-      : true;
-
-    if (!data.Items || data.Items.length === 0 || isStale) {
-      const currentTime = Date.now();
-      const marketCloseTime = getMarketCloseTime();
-
-      if (!isMarketOpen() && (currentTime - marketCloseTime) > twentyMinutes) {
-        // Market closed for more than 20 minutes
-        if (data.Items && data.Items.length > 0) {
-          // Return stale data rather than fetching (market is closed)
-          return ok(data.Items[0], 200, CORS);
-        } else {
-          // No data at all and market is closed
-          return err(404, "No data available - market is closed", CORS);
-        }
-      }
-
-      // Market is open or recently closed - fetch fresh data
-      const payload = {
-        queryStringParameters: { symbol }
-      };
-
-      const lambda_params = {
-        FunctionName: process.env.INTRADAY_PUT_FUNCTION_NAME,
-        InvocationType: "RequestResponse",
-        Payload: JSON.stringify(payload),
-      };
-
-      console.log("Invoking Lambda to fetch fresh data...");
-      const lambdaResponse = await lambda.send(new InvokeCommand(lambda_params));
-
-      const responsePayload = JSON.parse(Buffer.from(lambdaResponse.Payload).toString());
-      console.log("Lambda Response:", JSON.stringify(responsePayload, null, 2));
-
-      // Check for Lambda errors
-      if (lambdaResponse.FunctionError) {
-        console.error("Lambda execution error:", responsePayload);
-
-        // Return stale data if available, otherwise error
-        if (data.Items && data.Items.length > 0) {
-          return ok(data.Items[0], 200, CORS);
-        }
-
-        return err(500, "Failed to fetch fresh data", CORS);
-      }
-
-      // Query again after Lambda execution
-      const new_data = await dynamo.send(new QueryCommand(params));
-      console.log("New data after Lambda:", new_data.Items);
-
-      if (!new_data.Items || new_data.Items.length === 0) {
-        return err(404, "No data available for symbol", CORS);
-      }
-
-      return ok(new_data.Items[0], 200, CORS);
+    let needsFreshFetch;
+    if (!hasData) {
+      // Never cached — always worth trying, market open or not.
+      needsFreshFetch = true;
+    } else if (isMarketOpen()) {
+      const twentyMinutes = 20 * 60 * 1000;
+      const dataTime = new Date(data.Items[0].timestamp).getTime();
+      needsFreshFetch = (Date.now() - dataTime) > twentyMinutes;
+    } else {
+      // Market closed, data on file: that data IS the close. Trade
+      // against it regardless of how long ago it landed — no more
+      // computing "today's close" by hand, which broke on weekends.
+      needsFreshFetch = false;
     }
 
-    // Data is fresh, return it
-    return ok(data.Items[0], 200, CORS);
+    if (!needsFreshFetch) {
+      return ok(data.Items[0], 200, CORS);
+    }
+
+    console.log(`Invoking intraday-put for ${symbol}...`);
+    const fresh = await fetchFreshData(symbol);
+
+    if (fresh) {
+      return ok(fresh, 200, CORS);
+    }
+
+    // Invoke succeeded but returned nothing new (or failed) — fall back
+    // to cached data if any exists rather than a hard error.
+    if (hasData) {
+      return ok(data.Items[0], 200, CORS);
+    }
+
+    return err(404, "No data available for symbol", CORS);
 
   } catch (error) {
     console.error("Error:", error);
